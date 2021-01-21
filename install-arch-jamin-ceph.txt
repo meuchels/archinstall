@@ -1,0 +1,365 @@
+#!/bin/bash
+# Written by Jamin W. Collins <jamin.collins@gmail.com>
+set -e
+
+user_input() {
+    PROMPT="${1}"
+    if [ -n "${2}" ]; then
+        PROMPT="${PROMPT} [${2}]"
+    fi
+    PROMPT="${PROMPT}: "
+    read -p "${PROMPT}" RESP
+
+    if [[ -z "${RESP}" && -n "${2}" ]]; then
+        RESP=${2}
+    fi
+
+    echo ${RESP}
+}
+
+_check_marker() {
+    #TODO: improve this to be time based?
+    test -f /tmp/${1} && return 0 || return 1
+}
+
+_drop_marker() {
+    touch /tmp/${1}
+}
+
+_log() {
+    echo ${@}
+}
+
+info() {
+    _log "I: ${@}"
+}
+
+warn() {
+    _log "W: ${@}"
+}
+
+error() {
+    _log "E: ${@}"
+}
+
+abort() {
+    error ${@}
+    exit 1
+}
+
+LOGIN=$(user_input "User's login" "jamin")
+FULLNAME=$(user_input "User's full name" "Jamin Collins")
+
+FS=$(user_input "Desired filesystem" "xfs")
+
+# where to mount target system volumes for installation
+TGT=/target
+
+# Desired name for the LVM volume group
+VG=$(user_input "LVM volume group name" "vg0")
+
+# find the local drive
+DEV=''
+for ENTRY in /sys/block/sd*; do
+    grep -q '^0$' ${ENTRY}/removable && \
+    DEV="/dev/$(basename ${ENTRY})" && \
+    break
+done
+[ -z "${DEV}" ] && abort "couldn't find a local drive"
+DEV=$(user_input "Destination device" "${DEV}")
+[ -b "${DEV}" ] || abort "[${DEV}] is not a valid block device"
+
+info "will partition ${DEV} ..."
+
+# ensure that we have general Internet connectivity?
+ip route | grep -q '^default' || wifi-menu -o
+
+# make sure that we are connected?
+ip route | grep -q '^default' || abort "the system does not have a default route"
+
+VERBOSE=$(user_input "Verbose script output" "yes")
+[ "${VERBOSE}" = "yes" ] && set -x
+
+# **** prompting done ****
+
+update_package_list() {
+    _check_marker ${FUNCNAME} && return
+
+    # update mirrors list
+    # Use a more local mirror
+    cat > /etc/pacman.d/mirrorlist <<"EOF"
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+EOF
+
+    # refresh the package list
+    info "refreshing package list ..."
+    pacman --sync --refresh --refresh
+
+    if [ ! -x /usr/bin/reflector ]; then
+        pacman --sync --refresh --noconfirm reflector
+        #TODO: should avoid doing this if it's been done recently?
+        info "finding preferred mirrors, this may take a while ..."
+        reflector --protocol https --threads 4 --fastest 5 \
+            --age 4 --sort rate --connection-timeout 3 \
+            --save /etc/pacman.d/mirrorlist
+        pacman --sync --refresh --refresh
+    fi
+
+    _drop_marker ${FUNCNAME}
+}
+
+install_prereqs() {
+    _check_marker ${FUNCNAME} && return
+
+    update_package_list
+    pacman --sync --noconfirm dmidecode bc
+
+    _drop_marker ${FUNCNAME}
+}
+
+_mkfs() {
+    true
+}
+
+prepare_target() {
+    _check_marker ${FUNCNAME} && return
+
+    DEVSIZE=$(echo $(blockdev --getsize64 /dev/sda)/1024^3 | bc)
+
+    #TODO: improve this logic to check based on device and work backward from there
+    # ensure that nothing is mounted
+    SLEEP=false
+    for ENTRY in /dev/mapper/${VG}-*; do
+        test -b $(readlink -f ${ENTRY}) || break
+        umount -f ${ENTRY} || true
+        lvchange -an ${ENTRY}
+        ls /dev/mapper/
+        SLEEP=true
+    done
+    ls /dev/mapper/
+    ${SLEEP} && sync && sleep 2
+
+    #TODO: this should use GPT if possible, and only fall back to using MSDOS
+    # partition the disks
+    dd if=/dev/zero of=${DEV} bs=1M count=10 oflag=direct > /dev/null
+    parted ${DEV} --script -- mklabel msdos
+    parted ${DEV} --script -- mkpart primary 0% 100%
+
+    # put everything within LVM
+    pvremove -ffy ${DEV}1
+    sync
+    pvcreate --zero y -ffy ${DEV}1
+    sync
+    sleep 1
+    vgcreate --zero y ${VG} ${DEV}1
+
+    #TODO: should handle even smaller volumes eventually
+    lvcreate --wipesignatures y --zero y -L 20G -n root ${VG} <<<y
+    mkfs.${FS} -f /dev/mapper/${VG}-root
+    lvcreate --wipesignatures y --zero y -L 2G -n log ${VG} <<<y
+    mkfs.${FS} -f /dev/mapper/${VG}-log
+    mkdir -p ${TGT}
+    mount /dev/mapper/${VG}-root ${TGT}
+    mkdir -p ${TGT}/var/log
+    mount /dev/mapper/${VG}-log ${TGT}/var/log
+
+    if [ "${DEVSIZE}" -ge 50 ]; then
+        lvcreate --wipesignatures y --zero y -L 20G -n home ${VG} <<<y
+        mkfs.${FS} -f /dev/mapper/${VG}-home
+        mkdir -p ${TGT}/home
+        mount /dev/mapper/${VG}-home ${TGT}/home
+    fi
+
+    _drop_marker ${FUNCNAME}
+}
+
+base_install() {
+    _check_marker ${FUNCNAME} && return
+
+    # copy optimized package list into the chroot?
+    mkdir -p ${TGT}/etc/pacman.d/
+    cp /etc/pacman.d/mirrorlist ${TGT}/etc/pacman.d/mirrorlist
+
+    # base install
+    pacstrap ${TGT} base base-devel grub
+
+    genfstab -U -p ${TGT} >> ${TGT}/etc/fstab
+
+    ## Standard bits
+    # dialog -- needed by wifi-menu
+    # net-tools -- provides ifconfig, et al.
+    # wireless_tools -- provides iwconfig
+    # wpa_supplicant -- duh
+    # dhclient -- duh
+    # networkmanager -- networking
+    # reflector -- automated adjustment of pacman mirrors list
+    # ntp -- always a good idea
+    # tmux --
+    # git -- project revision tracking
+
+    pacstrap ${TGT} vim openssh syslog-ng ntp systemd-sysvcompat \
+        dialog net-tools wireless_tools wpa_supplicant dhclient \
+        bash-completion reflector networkmanager tmux git
+
+    arch-chroot ${TGT} /bin/bash -c "systemctl enable NetworkManager"
+
+    _drop_marker ${FUNCNAME}
+}
+
+gui_install() {
+    _check_marker ${FUNCNAME} && return
+
+    ## Graphical bits
+    # xorg -- the X server
+    # xfce4 -- the desktop environment
+    # xfce4-goodies -- various useful bits for xfce
+    # chromium -- browser
+    # ttf-dejavu
+    # ttf-bitstream-vera
+    # ttf-ubuntu-font-family
+    # wmctrl -- command line interaction with window manager
+    # network-manager-applet
+    # networkmanager-openvpn
+    # gvfs
+    # libreoffice-en-US -- force install the US lang pack
+    # libreoffice -- office suite
+    # gimp
+    # simple-scan
+    # xbindkeys -- hot key management utility
+    # evince -- document viewer
+    # vlc -- video player
+    # flashplugin -- sadly still needed by many sites
+    # deluge -- always good to have a torrent client
+    # pidgin -- IM client
+    # owncloud-client
+
+    pacstrap ${TGT} xorg xfce4 xfce4-goodies chromium \
+        ttf-dejavu ttf-bitstream-vera ttf-ubuntu-font-family wmctrl \
+        network-manager-applet networkmanager-openvpn \
+        gvfs libreoffice-en-US libreoffice gimp simple-scan \
+        xbindkeys evince vlc flashplugin deluge pidgin \
+        owncloud-client
+
+    _drop_marker ${FUNCNAME}
+}
+
+virtsupport_install() {
+    _check_marker ${FUNCNAME} && return
+
+    # if the system supports virtualization, install it
+    if egrep -q '(vmx|svm)' /proc/cpuinfo; then
+        pacstrap ${TGT} qemu libvirt virt-manager bridge-utils dnsmasq
+        # enable libvirt service
+        arch-chroot ${TGT} /bin/bash -c "systemctl enable libvirtd.service"
+    #TODO: configure polkit here
+    fi
+
+    _drop_marker ${FUNCNAME}
+}
+
+make_bootable() {
+    _check_marker ${FUNCNAME} && return
+
+    # adjust the ramdisk creation
+    sed -ri 's/^(HOOKS=".*block)(.*)/\1 lvm2\2/g' ${TGT}/etc/mkinitcpio.conf
+    arch-chroot ${TGT} /bin/bash -c "mkinitcpio -p linux"
+
+    #TODO: run quirks for the system
+    SYSTEM=$(dmidecode -s system-version | tr ' ' '_')
+    if [ -d quirks/${SYSTEM} ]; then
+        warn "not yet implemented"
+    fi
+
+    # install the boot loader
+    arch-chroot ${TGT} /bin/bash -c "grub-mkconfig > /boot/grub/grub.cfg"
+    arch-chroot ${TGT} /bin/bash -c "grub-install --recheck ${DEV}"
+
+    _drop_marker ${FUNCNAME}
+}
+
+create_user() {
+    _check_marker ${FUNCNAME} && return
+
+    # create the user in the new system
+    arch-chroot ${TGT} useradd --groups wheel,adm,users,video,audio --user-group --create-home --comment "${FULLNAME}" ${LOGIN}
+    arch-chroot ${TGT} passwd ${LOGIN}
+
+    # add the user to sudoers password-less (for now)
+    umask 0337
+    awk '/NOPASSWD/ {print substr($0,3)}' ${TGT}/etc/sudoers > ${TGT}/etc/sudoers.d/wheel
+
+    _drop_marker ${FUNCNAME}
+}
+
+get_mdm() {
+    _check_marker ${FUNCNAME} && return
+
+    # install it
+    arch-chroot ${TGT} su ${LOGIN} -c "yaourt -S --noconfirm mdm-display-manager"
+    arch-chroot ${TGT} su ${LOGIN} -c "yaourt -S --noconfirm mdmodern-mdm-theme-git"
+
+    CONFIG=${TGT}/usr/share/mdm/defaults.conf
+    # tweak the config
+    sed -i 's,^Browser=.*,Browser=true,' ${CONFIG}
+    sed -ri 's,^#?IncludeAll=.*,IncludeAll=true,' ${CONFIG}
+    sed -ri 's,^#?MinimalUID=.*,MinimalUID=1000,' ${CONFIG}
+    sed -ri 's,^#?DefaultSession=.*,DefaultSession=xfce.desktop,' ${CONFIG}
+    sed -ri 's,^#?Greeter=.*,Greeter=/usr/lib/mdm/mdmwebkit,' ${CONFIG}
+    sed -ri '/^.greeter./a HTMLTheme=mdmodern' ${CONFIG}
+
+    # enable it
+    arch-chroot ${TGT} systemctl enable mdm.service
+
+    _drop_marker ${FUNCNAME}
+}
+
+install_aur_pkg() {
+    PKG_NAME=${1}
+
+    [ -z "${LOGIN}" ] && abort "LOGIN not defined"
+    [ -z "${TGT}" ] && abort "TGT not defined"
+    [ -z "${PKG_NAME}" ] && abort "PKG_NAME not provided"
+
+    AUR_PKG_BASE="https://aur.archlinux.org/packages"
+    FMT="tar.gz"
+    PKG_URL="${AUR_PKG_BASE}/${PKG_NAME::2}/${PKG_NAME}/${PKG_NAME}.${FMT}"
+
+    TMPDIR=${TGT}/home/${LOGIN}/tmp
+    umask 0022
+    mkdir -p ${TMPDIR}
+
+    pushd ${TMPDIR}
+    curl ${PKG_URL} > ${PKG_NAME}.${FMT}
+    tar -xvf ${PKG_NAME}.${FMT}
+    pushd ${PKG_NAME}
+    rm -f *.pkg.tar.xz
+
+    CHROOT_TMPDIR=${TMPDIR:${#TGT}}
+    arch-chroot ${TGT} /bin/bash -c "chown -R ${LOGIN}:${LOGIN} ${CHROOT_TMPDIR}"
+    # these next two need to execute at the right point inside the chroot
+    CHROOT_PKGDIR=${CHROOT_TMPDIR}/${PKG_NAME}
+    arch-chroot ${TGT} su ${LOGIN} -c "pushd ${CHROOT_PKGDIR}; makepkg -s --noconfirm"
+    arch-chroot ${TGT} /bin/bash -c "pushd ${CHROOT_PKGDIR}; pacman -U --noconfirm *.pkg.tar.xz"
+}
+
+get_yaourt() {
+    _check_marker ${FUNCNAME} && return
+
+    install_aur_pkg package-query
+    install_aur_pkg yaourt
+
+    _drop_marker ${FUNCNAME}
+}
+
+
+install_prereqs
+prepare_target
+base_install
+gui_install
+virtsupport_install
+create_user
+get_yaourt
+get_mdm
+make_bootable
+
+# vim: set ft=sh ts=4 sw=4 et:

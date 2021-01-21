@@ -1,5 +1,6 @@
 #!/bin/bash
 # Written by Jamin W. Collins <jamin.collins@gmail.com>
+# Edited by Sam Meuchel
 set -e
 
 user_input() {
@@ -47,8 +48,8 @@ abort() {
     exit 1
 }
 
-LOGIN=$(user_input "User's login" "jamin")
-FULLNAME=$(user_input "User's full name" "Jamin Collins")
+LOGIN=$(user_input "User's login" "meuchel")
+FULLNAME=$(user_input "User's full name" "Samuel C. Meuchel")
 
 FS=$(user_input "Desired filesystem" "xfs")
 
@@ -219,26 +220,23 @@ gui_install() {
     # ttf-ubuntu-font-family
     # wmctrl -- command line interaction with window manager
     # network-manager-applet
-    # networkmanager-openvpn
-    # gvfs
-    # libreoffice-en-US -- force install the US lang pack
-    # libreoffice -- office suite
-    # gimp
-    # simple-scan
+    # networkmanager-openvpn -no
+    # gvfs -no
+    # libreoffice-en-US -- force install the US lang pack -no
+    # libreoffice -- office suite -no
+    # gimp -no
+    # simple-scan -no
     # xbindkeys -- hot key management utility
-    # evince -- document viewer
-    # vlc -- video player
-    # flashplugin -- sadly still needed by many sites
-    # deluge -- always good to have a torrent client
-    # pidgin -- IM client
-    # owncloud-client
+    # evince -- document viewer -no
+    # vlc -- video player no
+    # flashplugin -- sadly still needed by many sites -no
+    # deluge -- always good to have a torrent client -no
+    # pidgin -- IM client -no
+    # owncloud-client -no
 
     pacstrap ${TGT} xorg xfce4 xfce4-goodies chromium \
         ttf-dejavu ttf-bitstream-vera ttf-ubuntu-font-family wmctrl \
-        network-manager-applet networkmanager-openvpn \
-        gvfs libreoffice-en-US libreoffice gimp simple-scan \
-        xbindkeys evince vlc flashplugin deluge pidgin \
-        owncloud-client
+        network-manager-applet xbindkeys
 
     _drop_marker ${FUNCNAME}
 }

@@ -356,8 +356,8 @@ base_install
 gui_install
 virtsupport_install
 create_user
-get_yaourt
-get_mdm
+#get_yaourt
+#get_mdm
 make_bootable
 
 # vim: set ft=sh ts=4 sw=4 et:
